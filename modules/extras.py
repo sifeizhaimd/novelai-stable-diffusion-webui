@@ -1,163 +1,24 @@
-import math
 import os
+import re
+import shutil
+import json
 
-import numpy as np
-from PIL import Image
 
 import torch
 import tqdm
 
-from modules import processing, shared, images, devices, sd_models
-from modules.shared import opts
-import modules.gfpgan_model
-from modules.ui import plaintext_to_html
-import modules.codeformer_model
-import piexif
-import piexif.helper
+from modules import shared, images, sd_models, sd_vae, sd_models_config, errors
+from modules.ui_common import plaintext_to_html
 import gradio as gr
-
-
-cached_images = {}
-
-
-def run_extras(extras_mode, resize_mode, image, image_folder, input_dir, output_dir, show_extras_results, gfpgan_visibility, codeformer_visibility, codeformer_weight, upscaling_resize, upscaling_resize_w, upscaling_resize_h, upscaling_crop, extras_upscaler_1, extras_upscaler_2, extras_upscaler_2_visibility):
-    devices.torch_gc()
-
-    imageArr = []
-    # Also keep track of original file names
-    imageNameArr = []
-    outputs = []
-    
-    if extras_mode == 1:
-        #convert file to pillow image
-        for img in image_folder:
-            image = Image.open(img)
-            imageArr.append(image)
-            imageNameArr.append(os.path.splitext(img.orig_name)[0])
-    elif extras_mode == 2:
-        assert not shared.cmd_opts.hide_ui_dir_config, '--hide-ui-dir-config option must be disabled'
-
-        if input_dir == '':
-            return outputs, "Please select an input directory.", ''
-        image_list = [file for file in [os.path.join(input_dir, x) for x in os.listdir(input_dir)] if os.path.isfile(file)]
-        for img in image_list:
-            image = Image.open(img)
-            imageArr.append(image)
-            imageNameArr.append(img)
-    else:
-        imageArr.append(image)
-        imageNameArr.append(None)
-
-    if extras_mode == 2 and output_dir != '':
-        outpath = output_dir
-    else:
-        outpath = opts.outdir_samples or opts.outdir_extras_samples
-
-    
-    for image, image_name in zip(imageArr, imageNameArr):
-        if image is None:
-            return outputs, "Please select an input image.", ''
-        existing_pnginfo = image.info or {}
-
-        image = image.convert("RGB")
-        info = ""
-
-        if gfpgan_visibility > 0:
-            restored_img = modules.gfpgan_model.gfpgan_fix_faces(np.array(image, dtype=np.uint8))
-            res = Image.fromarray(restored_img)
-
-            if gfpgan_visibility < 1.0:
-                res = Image.blend(image, res, gfpgan_visibility)
-
-            info += f"GFPGAN visibility:{round(gfpgan_visibility, 2)}\n"
-            image = res
-
-        if codeformer_visibility > 0:
-            restored_img = modules.codeformer_model.codeformer.restore(np.array(image, dtype=np.uint8), w=codeformer_weight)
-            res = Image.fromarray(restored_img)
-
-            if codeformer_visibility < 1.0:
-                res = Image.blend(image, res, codeformer_visibility)
-
-            info += f"CodeFormer w: {round(codeformer_weight, 2)}, CodeFormer visibility:{round(codeformer_visibility, 2)}\n"
-            image = res
-
-        if resize_mode == 1:
-            upscaling_resize = max(upscaling_resize_w/image.width, upscaling_resize_h/image.height)
-            crop_info = " (crop)" if upscaling_crop else ""
-            info += f"Resize to: {upscaling_resize_w:g}x{upscaling_resize_h:g}{crop_info}\n"
-
-        if upscaling_resize != 1.0:
-            def upscale(image, scaler_index, resize, mode, resize_w, resize_h, crop):
-                small = image.crop((image.width // 2, image.height // 2, image.width // 2 + 10, image.height // 2 + 10))
-                pixels = tuple(np.array(small).flatten().tolist())
-                key = (resize, scaler_index, image.width, image.height, gfpgan_visibility, codeformer_visibility, codeformer_weight, 
-                       resize_mode, upscaling_resize, upscaling_resize_w, upscaling_resize_h, upscaling_crop) + pixels
-
-                c = cached_images.get(key)
-                if c is None:
-                    upscaler = shared.sd_upscalers[scaler_index]
-                    c = upscaler.scaler.upscale(image, resize, upscaler.data_path)
-                    if mode == 1 and crop:
-                        cropped = Image.new("RGB", (resize_w, resize_h))
-                        cropped.paste(c, box=(resize_w // 2 - c.width // 2, resize_h // 2 - c.height // 2))
-                        c = cropped
-                    cached_images[key] = c
-
-                return c
-
-            info += f"Upscale: {round(upscaling_resize, 3)}, model:{shared.sd_upscalers[extras_upscaler_1].name}\n"
-            res = upscale(image, extras_upscaler_1, upscaling_resize, resize_mode, upscaling_resize_w, upscaling_resize_h, upscaling_crop)
-
-            if extras_upscaler_2 != 0 and extras_upscaler_2_visibility > 0:
-                res2 = upscale(image, extras_upscaler_2, upscaling_resize, resize_mode, upscaling_resize_w, upscaling_resize_h, upscaling_crop)
-                info += f"Upscale: {round(upscaling_resize, 3)}, visibility: {round(extras_upscaler_2_visibility, 3)}, model:{shared.sd_upscalers[extras_upscaler_2].name}\n"
-                res = Image.blend(res, res2, extras_upscaler_2_visibility)
-
-            image = res
-
-        while len(cached_images) > 2:
-            del cached_images[next(iter(cached_images.keys()))]
-
-        images.save_image(image, path=outpath, basename="", seed=None, prompt=None, extension=opts.samples_format, info=info, short_filename=True,
-                          no_prompt=True, grid=False, pnginfo_section_name="extras", existing_info=existing_pnginfo,
-                          forced_filename=image_name if opts.use_original_name_batch else None)
-
-        if opts.enable_pnginfo:
-            image.info = existing_pnginfo
-            image.info["extras"] = info
-
-        if extras_mode != 2 or show_extras_results :
-            outputs.append(image)
-
-    devices.torch_gc()
-
-    return outputs, plaintext_to_html(info), ''
+import safetensors.torch
 
 
 def run_pnginfo(image):
     if image is None:
         return '', '', ''
 
-    items = image.info
-    geninfo = ''
-
-    if "exif" in image.info:
-        exif = piexif.load(image.info["exif"])
-        exif_comment = (exif or {}).get("Exif", {}).get(piexif.ExifIFD.UserComment, b'')
-        try:
-            exif_comment = piexif.helper.UserComment.load(exif_comment)
-        except ValueError:
-            exif_comment = exif_comment.decode('utf8', errors="ignore")
-
-        items['exif comment'] = exif_comment
-        geninfo = exif_comment
-
-        for field in ['jfif', 'jfif_version', 'jfif_unit', 'jfif_density', 'dpi', 'exif',
-                      'loop', 'background', 'timestamp', 'duration']:
-            items.pop(field, None)
-
-    geninfo = items.get('parameters', geninfo)
+    geninfo, items = images.read_info_from_image(image)
+    items = {**{'parameters': geninfo}, **items}
 
     info = ''
     for key, text in items.items():
@@ -175,7 +36,63 @@ def run_pnginfo(image):
     return '', geninfo, info
 
 
-def run_modelmerger(primary_model_name, secondary_model_name, teritary_model_name, interp_method, multiplier, save_as_half, custom_name):
+def create_config(ckpt_result, config_source, a, b, c):
+    def config(x):
+        res = sd_models_config.find_checkpoint_config_near_filename(x) if x else None
+        return res if res != shared.sd_default_config else None
+
+    if config_source == 0:
+        cfg = config(a) or config(b) or config(c)
+    elif config_source == 1:
+        cfg = config(b)
+    elif config_source == 2:
+        cfg = config(c)
+    else:
+        cfg = None
+
+    if cfg is None:
+        return
+
+    filename, _ = os.path.splitext(ckpt_result)
+    checkpoint_filename = filename + ".yaml"
+
+    print("Copying config:")
+    print("   from:", cfg)
+    print("     to:", checkpoint_filename)
+    shutil.copyfile(cfg, checkpoint_filename)
+
+
+checkpoint_dict_skip_on_merge = ["cond_stage_model.transformer.text_model.embeddings.position_ids"]
+
+
+def to_half(tensor, enable):
+    if enable and tensor.dtype == torch.float:
+        return tensor.half()
+
+    return tensor
+
+
+def read_metadata(primary_model_name, secondary_model_name, tertiary_model_name):
+    metadata = {}
+
+    for checkpoint_name in [primary_model_name, secondary_model_name, tertiary_model_name]:
+        checkpoint_info = sd_models.checkpoints_list.get(checkpoint_name, None)
+        if checkpoint_info is None:
+            continue
+
+        metadata.update(checkpoint_info.metadata)
+
+    return json.dumps(metadata, indent=4, ensure_ascii=False)
+
+
+def run_modelmerger(id_task, primary_model_name, secondary_model_name, tertiary_model_name, interp_method, multiplier, save_as_half, custom_name, checkpoint_format, config_source, bake_in_vae, discard_weights, save_metadata, add_merge_recipe, copy_metadata_fields, metadata_json):
+    shared.state.begin(job="model-merge")
+
+    def fail(message):
+        shared.state.textinfo = message
+        shared.state.end()
+        return [*[gr.update() for _ in range(4)], message]
+
     def weighted_sum(theta0, theta1, alpha):
         return ((1 - alpha) * theta0) + (alpha * theta1)
 
@@ -185,69 +102,229 @@ def run_modelmerger(primary_model_name, secondary_model_name, teritary_model_nam
     def add_difference(theta0, theta1_2_diff, alpha):
         return theta0 + (alpha * theta1_2_diff)
 
-    primary_model_info = sd_models.checkpoints_list[primary_model_name]
-    secondary_model_info = sd_models.checkpoints_list[secondary_model_name]
-    teritary_model_info = sd_models.checkpoints_list.get(teritary_model_name, None)
+    def filename_weighted_sum():
+        a = primary_model_info.model_name
+        b = secondary_model_info.model_name
+        Ma = round(1 - multiplier, 2)
+        Mb = round(multiplier, 2)
 
-    print(f"Loading {primary_model_info.filename}...")
-    primary_model = torch.load(primary_model_info.filename, map_location='cpu')
-    theta_0 = sd_models.get_state_dict_from_checkpoint(primary_model)
+        return f"{Ma}({a}) + {Mb}({b})"
 
-    print(f"Loading {secondary_model_info.filename}...")
-    secondary_model = torch.load(secondary_model_info.filename, map_location='cpu')
-    theta_1 = sd_models.get_state_dict_from_checkpoint(secondary_model)
+    def filename_add_difference():
+        a = primary_model_info.model_name
+        b = secondary_model_info.model_name
+        c = tertiary_model_info.model_name
+        M = round(multiplier, 2)
 
-    if teritary_model_info is not None:
-        print(f"Loading {teritary_model_info.filename}...")
-        teritary_model = torch.load(teritary_model_info.filename, map_location='cpu')
-        theta_2 = sd_models.get_state_dict_from_checkpoint(teritary_model)
-    else:
-        teritary_model = None
-        theta_2 = None
+        return f"{a} + {M}({b} - {c})"
+
+    def filename_nothing():
+        return primary_model_info.model_name
 
     theta_funcs = {
-        "Weighted sum": (None, weighted_sum),
-        "Add difference": (get_difference, add_difference),
+        "Weighted sum": (filename_weighted_sum, None, weighted_sum),
+        "Add difference": (filename_add_difference, get_difference, add_difference),
+        "No interpolation": (filename_nothing, None, None),
     }
-    theta_func1, theta_func2 = theta_funcs[interp_method]
+    filename_generator, theta_func1, theta_func2 = theta_funcs[interp_method]
+    shared.state.job_count = (1 if theta_func1 else 0) + (1 if theta_func2 else 0)
 
-    print(f"Merging...")
+    if not primary_model_name:
+        return fail("Failed: Merging requires a primary model.")
+
+    primary_model_info = sd_models.checkpoints_list[primary_model_name]
+
+    if theta_func2 and not secondary_model_name:
+        return fail("Failed: Merging requires a secondary model.")
+
+    secondary_model_info = sd_models.checkpoints_list[secondary_model_name] if theta_func2 else None
+
+    if theta_func1 and not tertiary_model_name:
+        return fail(f"Failed: Interpolation method ({interp_method}) requires a tertiary model.")
+
+    tertiary_model_info = sd_models.checkpoints_list[tertiary_model_name] if theta_func1 else None
+
+    result_is_inpainting_model = False
+    result_is_instruct_pix2pix_model = False
+
+    if theta_func2:
+        shared.state.textinfo = "Loading B"
+        print(f"Loading {secondary_model_info.filename}...")
+        theta_1 = sd_models.read_state_dict(secondary_model_info.filename, map_location='cpu')
+    else:
+        theta_1 = None
 
     if theta_func1:
+        shared.state.textinfo = "Loading C"
+        print(f"Loading {tertiary_model_info.filename}...")
+        theta_2 = sd_models.read_state_dict(tertiary_model_info.filename, map_location='cpu')
+
+        shared.state.textinfo = 'Merging B and C'
+        shared.state.sampling_steps = len(theta_1.keys())
         for key in tqdm.tqdm(theta_1.keys()):
+            if key in checkpoint_dict_skip_on_merge:
+                continue
+
             if 'model' in key:
                 if key in theta_2:
                     t2 = theta_2.get(key, torch.zeros_like(theta_1[key]))
                     theta_1[key] = theta_func1(theta_1[key], t2)
                 else:
                     theta_1[key] = torch.zeros_like(theta_1[key])
-    del theta_2, teritary_model
 
+            shared.state.sampling_step += 1
+        del theta_2
+
+        shared.state.nextjob()
+
+    shared.state.textinfo = f"Loading {primary_model_info.filename}..."
+    print(f"Loading {primary_model_info.filename}...")
+    theta_0 = sd_models.read_state_dict(primary_model_info.filename, map_location='cpu')
+
+    print("Merging...")
+    shared.state.textinfo = 'Merging A and B'
+    shared.state.sampling_steps = len(theta_0.keys())
     for key in tqdm.tqdm(theta_0.keys()):
-        if 'model' in key and key in theta_1:
+        if theta_1 and 'model' in key and key in theta_1:
 
-            theta_0[key] = theta_func2(theta_0[key], theta_1[key], multiplier)
+            if key in checkpoint_dict_skip_on_merge:
+                continue
 
-            if save_as_half:
-                theta_0[key] = theta_0[key].half()
+            a = theta_0[key]
+            b = theta_1[key]
 
-    # I believe this part should be discarded, but I'll leave it for now until I am sure
-    for key in theta_1.keys():
-        if 'model' in key and key not in theta_0:
-            theta_0[key] = theta_1[key]
-            if save_as_half:
-                theta_0[key] = theta_0[key].half()
+            # this enables merging an inpainting model (A) with another one (B);
+            # where normal model would have 4 channels, for latenst space, inpainting model would
+            # have another 4 channels for unmasked picture's latent space, plus one channel for mask, for a total of 9
+            if a.shape != b.shape and a.shape[0:1] + a.shape[2:] == b.shape[0:1] + b.shape[2:]:
+                if a.shape[1] == 4 and b.shape[1] == 9:
+                    raise RuntimeError("When merging inpainting model with a normal one, A must be the inpainting model.")
+                if a.shape[1] == 4 and b.shape[1] == 8:
+                    raise RuntimeError("When merging instruct-pix2pix model with a normal one, A must be the instruct-pix2pix model.")
+
+                if a.shape[1] == 8 and b.shape[1] == 4:#If we have an Instruct-Pix2Pix model...
+                    theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, multiplier)#Merge only the vectors the models have in common.  Otherwise we get an error due to dimension mismatch.
+                    result_is_instruct_pix2pix_model = True
+                else:
+                    assert a.shape[1] == 9 and b.shape[1] == 4, f"Bad dimensions for merged layer {key}: A={a.shape}, B={b.shape}"
+                    theta_0[key][:, 0:4, :, :] = theta_func2(a[:, 0:4, :, :], b, multiplier)
+                    result_is_inpainting_model = True
+            else:
+                theta_0[key] = theta_func2(a, b, multiplier)
+
+            theta_0[key] = to_half(theta_0[key], save_as_half)
+
+        shared.state.sampling_step += 1
+
+    del theta_1
+
+    bake_in_vae_filename = sd_vae.vae_dict.get(bake_in_vae, None)
+    if bake_in_vae_filename is not None:
+        print(f"Baking in VAE from {bake_in_vae_filename}")
+        shared.state.textinfo = 'Baking in VAE'
+        vae_dict = sd_vae.load_vae_dict(bake_in_vae_filename, map_location='cpu')
+
+        for key in vae_dict.keys():
+            theta_0_key = 'first_stage_model.' + key
+            if theta_0_key in theta_0:
+                theta_0[theta_0_key] = to_half(vae_dict[key], save_as_half)
+
+        del vae_dict
+
+    if save_as_half and not theta_func2:
+        for key in theta_0.keys():
+            theta_0[key] = to_half(theta_0[key], save_as_half)
+
+    if discard_weights:
+        regex = re.compile(discard_weights)
+        for key in list(theta_0):
+            if re.search(regex, key):
+                theta_0.pop(key, None)
 
     ckpt_dir = shared.cmd_opts.ckpt_dir or sd_models.model_path
 
-    filename = primary_model_info.model_name + '_' + str(round(1-multiplier, 2)) + '-' + secondary_model_info.model_name + '_' + str(round(multiplier, 2)) + '-' + interp_method.replace(" ", "_") + '-merged.ckpt'
-    filename = filename if custom_name == '' else (custom_name + '.ckpt')
+    filename = filename_generator() if custom_name == '' else custom_name
+    filename += ".inpainting" if result_is_inpainting_model else ""
+    filename += ".instruct-pix2pix" if result_is_instruct_pix2pix_model else ""
+    filename += "." + checkpoint_format
+
     output_modelname = os.path.join(ckpt_dir, filename)
 
+    shared.state.nextjob()
+    shared.state.textinfo = "Saving"
     print(f"Saving to {output_modelname}...")
-    torch.save(primary_model, output_modelname)
+
+    metadata = {}
+
+    if save_metadata and copy_metadata_fields:
+        if primary_model_info:
+            metadata.update(primary_model_info.metadata)
+        if secondary_model_info:
+            metadata.update(secondary_model_info.metadata)
+        if tertiary_model_info:
+            metadata.update(tertiary_model_info.metadata)
+
+    if save_metadata:
+        try:
+            metadata.update(json.loads(metadata_json))
+        except Exception as e:
+            errors.display(e, "readin metadata from json")
+
+        metadata["format"] = "pt"
+
+    if save_metadata and add_merge_recipe:
+        merge_recipe = {
+            "type": "webui", # indicate this model was merged with webui's built-in merger
+            "primary_model_hash": primary_model_info.sha256,
+            "secondary_model_hash": secondary_model_info.sha256 if secondary_model_info else None,
+            "tertiary_model_hash": tertiary_model_info.sha256 if tertiary_model_info else None,
+            "interp_method": interp_method,
+            "multiplier": multiplier,
+            "save_as_half": save_as_half,
+            "custom_name": custom_name,
+            "config_source": config_source,
+            "bake_in_vae": bake_in_vae,
+            "discard_weights": discard_weights,
+            "is_inpainting": result_is_inpainting_model,
+            "is_instruct_pix2pix": result_is_instruct_pix2pix_model
+        }
+
+        sd_merge_models = {}
+
+        def add_model_metadata(checkpoint_info):
+            checkpoint_info.calculate_shorthash()
+            sd_merge_models[checkpoint_info.sha256] = {
+                "name": checkpoint_info.name,
+                "legacy_hash": checkpoint_info.hash,
+                "sd_merge_recipe": checkpoint_info.metadata.get("sd_merge_recipe", None)
+            }
+
+            sd_merge_models.update(checkpoint_info.metadata.get("sd_merge_models", {}))
+
+        add_model_metadata(primary_model_info)
+        if secondary_model_info:
+            add_model_metadata(secondary_model_info)
+        if tertiary_model_info:
+            add_model_metadata(tertiary_model_info)
+
+        metadata["sd_merge_recipe"] = json.dumps(merge_recipe)
+        metadata["sd_merge_models"] = json.dumps(sd_merge_models)
+
+    _, extension = os.path.splitext(output_modelname)
+    if extension.lower() == ".safetensors":
+        safetensors.torch.save_file(theta_0, output_modelname, metadata=metadata if len(metadata)>0 else None)
+    else:
+        torch.save(theta_0, output_modelname)
 
     sd_models.list_models()
+    created_model = next((ckpt for ckpt in sd_models.checkpoints_list.values() if ckpt.name == filename), None)
+    if created_model:
+        created_model.calculate_shorthash()
 
-    print(f"Checkpoint saved.")
-    return ["Checkpoint saved to " + output_modelname] + [gr.Dropdown.update(choices=sd_models.checkpoint_tiles()) for _ in range(4)]
+    create_config(output_modelname, config_source, primary_model_info, secondary_model_info, tertiary_model_info)
+
+    print(f"Checkpoint saved to {output_modelname}.")
+    shared.state.textinfo = "Checkpoint saved"
+    shared.state.end()
+
+    return [*[gr.Dropdown.update(choices=sd_models.checkpoint_tiles()) for _ in range(4)], "Checkpoint saved to " + output_modelname]

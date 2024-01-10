@@ -1,80 +1,255 @@
-import math
-import os
-import sys
-import traceback
 import torch
-import numpy as np
-from torch import einsum
 from torch.nn.functional import silu
+from types import MethodType
 
-import modules.textual_inversion.textual_inversion
-from modules import prompt_parser, devices, sd_hijack_optimizations, shared
-from modules.shared import opts, device, cmd_opts
-from modules.sd_hijack_optimizations import invokeAI_mps_available
+from modules import devices, sd_hijack_optimizations, shared, script_callbacks, errors, sd_unet, patches
+from modules.hypernetworks import hypernetwork
+from modules.shared import cmd_opts
+from modules import sd_hijack_clip, sd_hijack_open_clip, sd_hijack_unet, sd_hijack_xlmr, xlmr, xlmr_m18
 
 import ldm.modules.attention
 import ldm.modules.diffusionmodules.model
+import ldm.modules.diffusionmodules.openaimodel
+import ldm.models.diffusion.ddpm
+import ldm.models.diffusion.ddim
+import ldm.models.diffusion.plms
+import ldm.modules.encoders.modules
+
+import sgm.modules.attention
+import sgm.modules.diffusionmodules.model
+import sgm.modules.diffusionmodules.openaimodel
+import sgm.modules.encoders.modules
 
 attention_CrossAttention_forward = ldm.modules.attention.CrossAttention.forward
 diffusionmodules_model_nonlinearity = ldm.modules.diffusionmodules.model.nonlinearity
 diffusionmodules_model_AttnBlock_forward = ldm.modules.diffusionmodules.model.AttnBlock.forward
 
-def apply_optimizations():
+# new memory efficient cross attention blocks do not support hypernets and we already
+# have memory efficient cross attention anyway, so this disables SD2.0's memory efficient cross attention
+ldm.modules.attention.MemoryEfficientCrossAttention = ldm.modules.attention.CrossAttention
+ldm.modules.attention.BasicTransformerBlock.ATTENTION_MODES["softmax-xformers"] = ldm.modules.attention.CrossAttention
+
+# silence new console spam from SD2
+ldm.modules.attention.print = shared.ldm_print
+ldm.modules.diffusionmodules.model.print = shared.ldm_print
+ldm.util.print = shared.ldm_print
+ldm.models.diffusion.ddpm.print = shared.ldm_print
+
+optimizers = []
+current_optimizer: sd_hijack_optimizations.SdOptimization = None
+
+ldm_patched_forward = sd_unet.create_unet_forward(ldm.modules.diffusionmodules.openaimodel.UNetModel.forward)
+ldm_original_forward = patches.patch(__file__, ldm.modules.diffusionmodules.openaimodel.UNetModel, "forward", ldm_patched_forward)
+
+sgm_patched_forward = sd_unet.create_unet_forward(sgm.modules.diffusionmodules.openaimodel.UNetModel.forward)
+sgm_original_forward = patches.patch(__file__, sgm.modules.diffusionmodules.openaimodel.UNetModel, "forward", sgm_patched_forward)
+
+
+def list_optimizers():
+    new_optimizers = script_callbacks.list_optimizers_callback()
+
+    new_optimizers = [x for x in new_optimizers if x.is_available()]
+
+    new_optimizers = sorted(new_optimizers, key=lambda x: x.priority, reverse=True)
+
+    optimizers.clear()
+    optimizers.extend(new_optimizers)
+
+
+def apply_optimizations(option=None):
+    global current_optimizer
+
     undo_optimizations()
 
-    ldm.modules.diffusionmodules.model.nonlinearity = silu
+    if len(optimizers) == 0:
+        # a script can access the model very early, and optimizations would not be filled by then
+        current_optimizer = None
+        return ''
 
-    if cmd_opts.force_enable_xformers or (cmd_opts.xformers and shared.xformers_available and torch.version.cuda and (6, 0) <= torch.cuda.get_device_capability(shared.device) <= (9, 0)):
-        print("Applying xformers cross attention optimization.")
-        ldm.modules.attention.CrossAttention.forward = sd_hijack_optimizations.xformers_attention_forward
-        ldm.modules.diffusionmodules.model.AttnBlock.forward = sd_hijack_optimizations.xformers_attnblock_forward
-    elif cmd_opts.opt_split_attention_v1:
-        print("Applying v1 cross attention optimization.")
-        ldm.modules.attention.CrossAttention.forward = sd_hijack_optimizations.split_cross_attention_forward_v1
-    elif not cmd_opts.disable_opt_split_attention and (cmd_opts.opt_split_attention_invokeai or not torch.cuda.is_available()):
-        if not invokeAI_mps_available and shared.device.type == 'mps':
-            print("The InvokeAI cross attention optimization for MPS requires the psutil package which is not installed.")
-            print("Applying v1 cross attention optimization.")
-            ldm.modules.attention.CrossAttention.forward = sd_hijack_optimizations.split_cross_attention_forward_v1
-        else:
-            print("Applying cross attention optimization (InvokeAI).")
-            ldm.modules.attention.CrossAttention.forward = sd_hijack_optimizations.split_cross_attention_forward_invokeAI
-    elif not cmd_opts.disable_opt_split_attention and (cmd_opts.opt_split_attention or torch.cuda.is_available()):
-        print("Applying cross attention optimization (Doggettx).")
-        ldm.modules.attention.CrossAttention.forward = sd_hijack_optimizations.split_cross_attention_forward
-        ldm.modules.diffusionmodules.model.AttnBlock.forward = sd_hijack_optimizations.cross_attention_attnblock_forward
+    ldm.modules.diffusionmodules.model.nonlinearity = silu
+    ldm.modules.diffusionmodules.openaimodel.th = sd_hijack_unet.th
+
+    sgm.modules.diffusionmodules.model.nonlinearity = silu
+    sgm.modules.diffusionmodules.openaimodel.th = sd_hijack_unet.th
+
+    if current_optimizer is not None:
+        current_optimizer.undo()
+        current_optimizer = None
+
+    selection = option or shared.opts.cross_attention_optimization
+    if selection == "Automatic" and len(optimizers) > 0:
+        matching_optimizer = next(iter([x for x in optimizers if x.cmd_opt and getattr(shared.cmd_opts, x.cmd_opt, False)]), optimizers[0])
+    else:
+        matching_optimizer = next(iter([x for x in optimizers if x.title() == selection]), None)
+
+    if selection == "None":
+        matching_optimizer = None
+    elif selection == "Automatic" and shared.cmd_opts.disable_opt_split_attention:
+        matching_optimizer = None
+    elif matching_optimizer is None:
+        matching_optimizer = optimizers[0]
+
+    if matching_optimizer is not None:
+        print(f"Applying attention optimization: {matching_optimizer.name}... ", end='')
+        matching_optimizer.apply()
+        print("done.")
+        current_optimizer = matching_optimizer
+        return current_optimizer.name
+    else:
+        print("Disabling attention optimization")
+        return ''
 
 
 def undo_optimizations():
-    from modules.hypernetworks import hypernetwork
-
-    ldm.modules.attention.CrossAttention.forward = hypernetwork.attention_CrossAttention_forward
     ldm.modules.diffusionmodules.model.nonlinearity = diffusionmodules_model_nonlinearity
+    ldm.modules.attention.CrossAttention.forward = hypernetwork.attention_CrossAttention_forward
     ldm.modules.diffusionmodules.model.AttnBlock.forward = diffusionmodules_model_AttnBlock_forward
 
+    sgm.modules.diffusionmodules.model.nonlinearity = diffusionmodules_model_nonlinearity
+    sgm.modules.attention.CrossAttention.forward = hypernetwork.attention_CrossAttention_forward
+    sgm.modules.diffusionmodules.model.AttnBlock.forward = diffusionmodules_model_AttnBlock_forward
 
-def get_target_prompt_token_count(token_count):
-    return math.ceil(max(token_count, 1) / 75) * 75
+
+def fix_checkpoint():
+    """checkpoints are now added and removed in embedding/hypernet code, since torch doesn't want
+    checkpoints to be added when not training (there's a warning)"""
+
+    pass
+
+
+def weighted_loss(sd_model, pred, target, mean=True):
+    #Calculate the weight normally, but ignore the mean
+    loss = sd_model._old_get_loss(pred, target, mean=False)
+
+    #Check if we have weights available
+    weight = getattr(sd_model, '_custom_loss_weight', None)
+    if weight is not None:
+        loss *= weight
+
+    #Return the loss, as mean if specified
+    return loss.mean() if mean else loss
+
+def weighted_forward(sd_model, x, c, w, *args, **kwargs):
+    try:
+        #Temporarily append weights to a place accessible during loss calc
+        sd_model._custom_loss_weight = w
+
+        #Replace 'get_loss' with a weight-aware one. Otherwise we need to reimplement 'forward' completely
+        #Keep 'get_loss', but don't overwrite the previous old_get_loss if it's already set
+        if not hasattr(sd_model, '_old_get_loss'):
+            sd_model._old_get_loss = sd_model.get_loss
+        sd_model.get_loss = MethodType(weighted_loss, sd_model)
+
+        #Run the standard forward function, but with the patched 'get_loss'
+        return sd_model.forward(x, c, *args, **kwargs)
+    finally:
+        try:
+            #Delete temporary weights if appended
+            del sd_model._custom_loss_weight
+        except AttributeError:
+            pass
+
+        #If we have an old loss function, reset the loss function to the original one
+        if hasattr(sd_model, '_old_get_loss'):
+            sd_model.get_loss = sd_model._old_get_loss
+            del sd_model._old_get_loss
+
+def apply_weighted_forward(sd_model):
+    #Add new function 'weighted_forward' that can be called to calc weighted loss
+    sd_model.weighted_forward = MethodType(weighted_forward, sd_model)
+
+def undo_weighted_forward(sd_model):
+    try:
+        del sd_model.weighted_forward
+    except AttributeError:
+        pass
 
 
 class StableDiffusionModelHijack:
     fixes = None
-    comments = []
     layers = None
     circular_enabled = False
     clip = None
+    optimization_method = None
 
-    embedding_db = modules.textual_inversion.textual_inversion.EmbeddingDatabase(cmd_opts.embeddings_dir)
+    def __init__(self):
+        import modules.textual_inversion.textual_inversion
+
+        self.extra_generation_params = {}
+        self.comments = []
+
+        self.embedding_db = modules.textual_inversion.textual_inversion.EmbeddingDatabase()
+        self.embedding_db.add_embedding_dir(cmd_opts.embeddings_dir)
+
+    def apply_optimizations(self, option=None):
+        try:
+            self.optimization_method = apply_optimizations(option)
+        except Exception as e:
+            errors.display(e, "applying cross attention optimization")
+            undo_optimizations()
+
+    def convert_sdxl_to_ssd(self, m):
+        """Converts an SDXL model to a Segmind Stable Diffusion model (see https://huggingface.co/segmind/SSD-1B)"""
+
+        delattr(m.model.diffusion_model.middle_block, '1')
+        delattr(m.model.diffusion_model.middle_block, '2')
+        for i in ['9', '8', '7', '6', '5', '4']:
+            delattr(m.model.diffusion_model.input_blocks[7][1].transformer_blocks, i)
+            delattr(m.model.diffusion_model.input_blocks[8][1].transformer_blocks, i)
+            delattr(m.model.diffusion_model.output_blocks[0][1].transformer_blocks, i)
+            delattr(m.model.diffusion_model.output_blocks[1][1].transformer_blocks, i)
+        delattr(m.model.diffusion_model.output_blocks[4][1].transformer_blocks, '1')
+        delattr(m.model.diffusion_model.output_blocks[5][1].transformer_blocks, '1')
+        devices.torch_gc()
 
     def hijack(self, m):
-        model_embeddings = m.cond_stage_model.transformer.text_model.embeddings
+        conditioner = getattr(m, 'conditioner', None)
+        if conditioner:
+            text_cond_models = []
 
-        model_embeddings.token_embedding = EmbeddingsWithFixes(model_embeddings.token_embedding, self)
-        m.cond_stage_model = FrozenCLIPEmbedderWithCustomWords(m.cond_stage_model, self)
+            for i in range(len(conditioner.embedders)):
+                embedder = conditioner.embedders[i]
+                typename = type(embedder).__name__
+                if typename == 'FrozenOpenCLIPEmbedder':
+                    embedder.model.token_embedding = EmbeddingsWithFixes(embedder.model.token_embedding, self)
+                    conditioner.embedders[i] = sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords(embedder, self)
+                    text_cond_models.append(conditioner.embedders[i])
+                if typename == 'FrozenCLIPEmbedder':
+                    model_embeddings = embedder.transformer.text_model.embeddings
+                    model_embeddings.token_embedding = EmbeddingsWithFixes(model_embeddings.token_embedding, self)
+                    conditioner.embedders[i] = sd_hijack_clip.FrozenCLIPEmbedderForSDXLWithCustomWords(embedder, self)
+                    text_cond_models.append(conditioner.embedders[i])
+                if typename == 'FrozenOpenCLIPEmbedder2':
+                    embedder.model.token_embedding = EmbeddingsWithFixes(embedder.model.token_embedding, self, textual_inversion_key='clip_g')
+                    conditioner.embedders[i] = sd_hijack_open_clip.FrozenOpenCLIPEmbedder2WithCustomWords(embedder, self)
+                    text_cond_models.append(conditioner.embedders[i])
+
+            if len(text_cond_models) == 1:
+                m.cond_stage_model = text_cond_models[0]
+            else:
+                m.cond_stage_model = conditioner
+
+        if type(m.cond_stage_model) == xlmr.BertSeriesModelWithTransformation or type(m.cond_stage_model) == xlmr_m18.BertSeriesModelWithTransformation:
+            model_embeddings = m.cond_stage_model.roberta.embeddings
+            model_embeddings.token_embedding = EmbeddingsWithFixes(model_embeddings.word_embeddings, self)
+            m.cond_stage_model = sd_hijack_xlmr.FrozenXLMREmbedderWithCustomWords(m.cond_stage_model, self)
+
+        elif type(m.cond_stage_model) == ldm.modules.encoders.modules.FrozenCLIPEmbedder:
+            model_embeddings = m.cond_stage_model.transformer.text_model.embeddings
+            model_embeddings.token_embedding = EmbeddingsWithFixes(model_embeddings.token_embedding, self)
+            m.cond_stage_model = sd_hijack_clip.FrozenCLIPEmbedderWithCustomWords(m.cond_stage_model, self)
+
+        elif type(m.cond_stage_model) == ldm.modules.encoders.modules.FrozenOpenCLIPEmbedder:
+            m.cond_stage_model.model.token_embedding = EmbeddingsWithFixes(m.cond_stage_model.model.token_embedding, self)
+            m.cond_stage_model = sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords(m.cond_stage_model, self)
+
+        apply_weighted_forward(m)
+        if m.cond_stage_key == "edit":
+            sd_hijack_unet.hijack_ddpm_edit()
+
+        self.apply_optimizations()
 
         self.clip = m.cond_stage_model
-
-        apply_optimizations()
 
         def flatten(el):
             flattened = [flatten(children) for children in el.children()]
@@ -85,13 +260,53 @@ class StableDiffusionModelHijack:
 
         self.layers = flatten(m)
 
+        import modules.models.diffusion.ddpm_edit
+
+        if isinstance(m, ldm.models.diffusion.ddpm.LatentDiffusion):
+            sd_unet.original_forward = ldm_original_forward
+        elif isinstance(m, modules.models.diffusion.ddpm_edit.LatentDiffusion):
+            sd_unet.original_forward = ldm_original_forward
+        elif isinstance(m, sgm.models.diffusion.DiffusionEngine):
+            sd_unet.original_forward = sgm_original_forward
+        else:
+            sd_unet.original_forward = None
+
+
     def undo_hijack(self, m):
-        if type(m.cond_stage_model) == FrozenCLIPEmbedderWithCustomWords:
+        conditioner = getattr(m, 'conditioner', None)
+        if conditioner:
+            for i in range(len(conditioner.embedders)):
+                embedder = conditioner.embedders[i]
+                if isinstance(embedder, (sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords, sd_hijack_open_clip.FrozenOpenCLIPEmbedder2WithCustomWords)):
+                    embedder.wrapped.model.token_embedding = embedder.wrapped.model.token_embedding.wrapped
+                    conditioner.embedders[i] = embedder.wrapped
+                if isinstance(embedder, sd_hijack_clip.FrozenCLIPEmbedderForSDXLWithCustomWords):
+                    embedder.wrapped.transformer.text_model.embeddings.token_embedding = embedder.wrapped.transformer.text_model.embeddings.token_embedding.wrapped
+                    conditioner.embedders[i] = embedder.wrapped
+
+            if hasattr(m, 'cond_stage_model'):
+                delattr(m, 'cond_stage_model')
+
+        elif type(m.cond_stage_model) == sd_hijack_xlmr.FrozenXLMREmbedderWithCustomWords:
             m.cond_stage_model = m.cond_stage_model.wrapped
 
-        model_embeddings = m.cond_stage_model.transformer.text_model.embeddings
-        if type(model_embeddings.token_embedding) == EmbeddingsWithFixes:
-            model_embeddings.token_embedding = model_embeddings.token_embedding.wrapped
+        elif type(m.cond_stage_model) == sd_hijack_clip.FrozenCLIPEmbedderWithCustomWords:
+            m.cond_stage_model = m.cond_stage_model.wrapped
+
+            model_embeddings = m.cond_stage_model.transformer.text_model.embeddings
+            if type(model_embeddings.token_embedding) == EmbeddingsWithFixes:
+                model_embeddings.token_embedding = model_embeddings.token_embedding.wrapped
+        elif type(m.cond_stage_model) == sd_hijack_open_clip.FrozenOpenCLIPEmbedderWithCustomWords:
+            m.cond_stage_model.wrapped.model.token_embedding = m.cond_stage_model.wrapped.model.token_embedding.wrapped
+            m.cond_stage_model = m.cond_stage_model.wrapped
+
+        undo_optimizations()
+        undo_weighted_forward(m)
+
+        self.apply_circular(False)
+        self.layers = None
+        self.clip = None
+
 
     def apply_circular(self, enable):
         if self.circular_enabled == enable:
@@ -104,273 +319,27 @@ class StableDiffusionModelHijack:
 
     def clear_comments(self):
         self.comments = []
+        self.extra_generation_params = {}
 
-    def tokenize(self, text):
-        _, remade_batch_tokens, _, _, _, token_count = self.clip.process_text([text])
-        return remade_batch_tokens[0], token_count, get_target_prompt_token_count(token_count)
+    def get_prompt_lengths(self, text):
+        if self.clip is None:
+            return "-", "-"
 
+        _, token_count = self.clip.process_texts([text])
 
-class FrozenCLIPEmbedderWithCustomWords(torch.nn.Module):
-    def __init__(self, wrapped, hijack):
-        super().__init__()
-        self.wrapped = wrapped
-        self.hijack: StableDiffusionModelHijack = hijack
-        self.tokenizer = wrapped.tokenizer
-        self.token_mults = {}
+        return token_count, self.clip.get_target_prompt_token_count(token_count)
 
-        self.comma_token = [v for k, v in self.tokenizer.get_vocab().items() if k == ',</w>'][0]
-
-        tokens_with_parens = [(k, v) for k, v in self.tokenizer.get_vocab().items() if '(' in k or ')' in k or '[' in k or ']' in k]
-        for text, ident in tokens_with_parens:
-            mult = 1.0
-            for c in text:
-                if c == '[':
-                    mult /= 1.1
-                if c == ']':
-                    mult *= 1.1
-                if c == '(':
-                    mult *= 1.1
-                if c == ')':
-                    mult /= 1.1
-
-            if mult != 1.0:
-                self.token_mults[ident] = mult
-
-    def tokenize_line(self, line, used_custom_terms, hijack_comments):
-        id_end = self.wrapped.tokenizer.eos_token_id
-
-        if opts.enable_emphasis:
-            parsed = prompt_parser.parse_prompt_attention(line)
-        else:
-            parsed = [[line, 1.0]]
-
-        tokenized = self.wrapped.tokenizer([text for text, _ in parsed], truncation=False, add_special_tokens=False)["input_ids"]
-
-        fixes = []
-        remade_tokens = []
-        multipliers = []
-        last_comma = -1
-
-        for tokens, (text, weight) in zip(tokenized, parsed):
-            i = 0
-            while i < len(tokens):
-                token = tokens[i]
-
-                embedding, embedding_length_in_tokens = self.hijack.embedding_db.find_embedding_at_position(tokens, i)
-
-                if token == self.comma_token:
-                    last_comma = len(remade_tokens)
-                elif opts.comma_padding_backtrack != 0 and max(len(remade_tokens), 1) % 75 == 0 and last_comma != -1 and len(remade_tokens) - last_comma <= opts.comma_padding_backtrack:
-                    last_comma += 1
-                    reloc_tokens = remade_tokens[last_comma:]
-                    reloc_mults = multipliers[last_comma:]
-
-                    remade_tokens = remade_tokens[:last_comma]
-                    length = len(remade_tokens)
-                    
-                    rem = int(math.ceil(length / 75)) * 75 - length
-                    remade_tokens += [id_end] * rem + reloc_tokens
-                    multipliers = multipliers[:last_comma] + [1.0] * rem + reloc_mults
-                
-                if embedding is None:
-                    remade_tokens.append(token)
-                    multipliers.append(weight)
-                    i += 1
-                else:
-                    emb_len = int(embedding.vec.shape[0])
-                    iteration = len(remade_tokens) // 75
-                    if (len(remade_tokens) + emb_len) // 75 != iteration:
-                        rem = (75 * (iteration + 1) - len(remade_tokens))
-                        remade_tokens += [id_end] * rem
-                        multipliers += [1.0] * rem
-                        iteration += 1
-                    fixes.append((iteration, (len(remade_tokens) % 75, embedding)))
-                    remade_tokens += [0] * emb_len
-                    multipliers += [weight] * emb_len
-                    used_custom_terms.append((embedding.name, embedding.checksum()))
-                    i += embedding_length_in_tokens
-
-        token_count = len(remade_tokens)
-        prompt_target_length = get_target_prompt_token_count(token_count)
-        tokens_to_add = prompt_target_length - len(remade_tokens)
-
-        remade_tokens = remade_tokens + [id_end] * tokens_to_add
-        multipliers = multipliers + [1.0] * tokens_to_add
-
-        return remade_tokens, fixes, multipliers, token_count
-
-    def process_text(self, texts):
-        used_custom_terms = []
-        remade_batch_tokens = []
-        hijack_comments = []
-        hijack_fixes = []
-        token_count = 0
-
-        cache = {}
-        batch_multipliers = []
-        for line in texts:
-            if line in cache:
-                remade_tokens, fixes, multipliers = cache[line]
-            else:
-                remade_tokens, fixes, multipliers, current_token_count = self.tokenize_line(line, used_custom_terms, hijack_comments)
-                token_count = max(current_token_count, token_count)
-
-                cache[line] = (remade_tokens, fixes, multipliers)
-
-            remade_batch_tokens.append(remade_tokens)
-            hijack_fixes.append(fixes)
-            batch_multipliers.append(multipliers)
-
-        return batch_multipliers, remade_batch_tokens, used_custom_terms, hijack_comments, hijack_fixes, token_count
-
-
-    def process_text_old(self, text):
-        id_start = self.wrapped.tokenizer.bos_token_id
-        id_end = self.wrapped.tokenizer.eos_token_id
-        maxlen = self.wrapped.max_length  # you get to stay at 77
-        used_custom_terms = []
-        remade_batch_tokens = []
-        overflowing_words = []
-        hijack_comments = []
-        hijack_fixes = []
-        token_count = 0
-
-        cache = {}
-        batch_tokens = self.wrapped.tokenizer(text, truncation=False, add_special_tokens=False)["input_ids"]
-        batch_multipliers = []
-        for tokens in batch_tokens:
-            tuple_tokens = tuple(tokens)
-
-            if tuple_tokens in cache:
-                remade_tokens, fixes, multipliers = cache[tuple_tokens]
-            else:
-                fixes = []
-                remade_tokens = []
-                multipliers = []
-                mult = 1.0
-
-                i = 0
-                while i < len(tokens):
-                    token = tokens[i]
-
-                    embedding, embedding_length_in_tokens = self.hijack.embedding_db.find_embedding_at_position(tokens, i)
-
-                    mult_change = self.token_mults.get(token) if opts.enable_emphasis else None
-                    if mult_change is not None:
-                        mult *= mult_change
-                        i += 1
-                    elif embedding is None:
-                        remade_tokens.append(token)
-                        multipliers.append(mult)
-                        i += 1
-                    else:
-                        emb_len = int(embedding.vec.shape[0])
-                        fixes.append((len(remade_tokens), embedding))
-                        remade_tokens += [0] * emb_len
-                        multipliers += [mult] * emb_len
-                        used_custom_terms.append((embedding.name, embedding.checksum()))
-                        i += embedding_length_in_tokens
-
-                if len(remade_tokens) > maxlen - 2:
-                    vocab = {v: k for k, v in self.wrapped.tokenizer.get_vocab().items()}
-                    ovf = remade_tokens[maxlen - 2:]
-                    overflowing_words = [vocab.get(int(x), "") for x in ovf]
-                    overflowing_text = self.wrapped.tokenizer.convert_tokens_to_string(''.join(overflowing_words))
-                    hijack_comments.append(f"Warning: too many input tokens; some ({len(overflowing_words)}) have been truncated:\n{overflowing_text}\n")
-
-                token_count = len(remade_tokens)
-                remade_tokens = remade_tokens + [id_end] * (maxlen - 2 - len(remade_tokens))
-                remade_tokens = [id_start] + remade_tokens[0:maxlen-2] + [id_end]
-                cache[tuple_tokens] = (remade_tokens, fixes, multipliers)
-
-            multipliers = multipliers + [1.0] * (maxlen - 2 - len(multipliers))
-            multipliers = [1.0] + multipliers[0:maxlen - 2] + [1.0]
-
-            remade_batch_tokens.append(remade_tokens)
-            hijack_fixes.append(fixes)
-            batch_multipliers.append(multipliers)
-        return batch_multipliers, remade_batch_tokens, used_custom_terms, hijack_comments, hijack_fixes, token_count
-    
-    def forward(self, text):
-        use_old = opts.use_old_emphasis_implementation
-        if use_old:
-            batch_multipliers, remade_batch_tokens, used_custom_terms, hijack_comments, hijack_fixes, token_count = self.process_text_old(text)
-        else:
-            batch_multipliers, remade_batch_tokens, used_custom_terms, hijack_comments, hijack_fixes, token_count = self.process_text(text)
-
-        self.hijack.comments += hijack_comments
-
-        if len(used_custom_terms) > 0:
-            self.hijack.comments.append("Used embeddings: " + ", ".join([f'{word} [{checksum}]' for word, checksum in used_custom_terms]))
-        
-        if use_old:
-            self.hijack.fixes = hijack_fixes
-            return self.process_tokens(remade_batch_tokens, batch_multipliers)
-        
-        z = None
-        i = 0
-        while max(map(len, remade_batch_tokens)) != 0:
-            rem_tokens = [x[75:] for x in remade_batch_tokens]
-            rem_multipliers = [x[75:] for x in batch_multipliers]
-
-            self.hijack.fixes = []
-            for unfiltered in hijack_fixes:
-                fixes = []
-                for fix in unfiltered:
-                    if fix[0] == i:
-                        fixes.append(fix[1])
-                self.hijack.fixes.append(fixes)
-            
-            tokens = []
-            multipliers = []
-            for j in range(len(remade_batch_tokens)):
-                if len(remade_batch_tokens[j]) > 0:
-                    tokens.append(remade_batch_tokens[j][:75])
-                    multipliers.append(batch_multipliers[j][:75])
-                else:
-                    tokens.append([self.wrapped.tokenizer.eos_token_id] * 75)
-                    multipliers.append([1.0] * 75)
-
-            z1 = self.process_tokens(tokens, multipliers)
-            z = z1 if z is None else torch.cat((z, z1), axis=-2)
-            
-            remade_batch_tokens = rem_tokens
-            batch_multipliers = rem_multipliers
-            i += 1
-        
-        return z
-        
-    
-    def process_tokens(self, remade_batch_tokens, batch_multipliers):
-        if not opts.use_old_emphasis_implementation:
-            remade_batch_tokens = [[self.wrapped.tokenizer.bos_token_id] + x[:75] + [self.wrapped.tokenizer.eos_token_id] for x in remade_batch_tokens]
-            batch_multipliers = [[1.0] + x[:75] + [1.0] for x in batch_multipliers]
-        
-        tokens = torch.asarray(remade_batch_tokens).to(device)
-        outputs = self.wrapped.transformer(input_ids=tokens, output_hidden_states=-opts.CLIP_stop_at_last_layers)
-
-        if opts.CLIP_stop_at_last_layers > 1:
-            z = outputs.hidden_states[-opts.CLIP_stop_at_last_layers]
-            z = self.wrapped.transformer.text_model.final_layer_norm(z)
-        else:
-            z = outputs.last_hidden_state
-
-        # restoring original mean is likely not correct, but it seems to work well to prevent artifacts that happen otherwise
-        batch_multipliers_of_same_length = [x + [1.0] * (75 - len(x)) for x in batch_multipliers]
-        batch_multipliers = torch.asarray(batch_multipliers_of_same_length).to(device)
-        original_mean = z.mean()
-        z *= batch_multipliers.reshape(batch_multipliers.shape + (1,)).expand(z.shape)
-        new_mean = z.mean()
-        z *= original_mean / new_mean
-
-        return z
+    def redo_hijack(self, m):
+        self.undo_hijack(m)
+        self.hijack(m)
 
 
 class EmbeddingsWithFixes(torch.nn.Module):
-    def __init__(self, wrapped, embeddings):
+    def __init__(self, wrapped, embeddings, textual_inversion_key='clip_l'):
         super().__init__()
         self.wrapped = wrapped
         self.embeddings = embeddings
+        self.textual_inversion_key = textual_inversion_key
 
     def forward(self, input_ids):
         batch_fixes = self.embeddings.fixes
@@ -384,9 +353,10 @@ class EmbeddingsWithFixes(torch.nn.Module):
         vecs = []
         for fixes, tensor in zip(batch_fixes, inputs_embeds):
             for offset, embedding in fixes:
-                emb = embedding.vec
-                emb_len = min(tensor.shape[0]-offset-1, emb.shape[0])
-                tensor = torch.cat([tensor[0:offset+1], emb[0:emb_len], tensor[offset+1+emb_len:]])
+                vec = embedding.vec[self.textual_inversion_key] if isinstance(embedding.vec, dict) else embedding.vec
+                emb = devices.cond_cast_unet(vec)
+                emb_len = min(tensor.shape[0] - offset - 1, emb.shape[0])
+                tensor = torch.cat([tensor[0:offset + 1], emb[0:emb_len], tensor[offset + 1 + emb_len:]])
 
             vecs.append(tensor)
 
@@ -403,3 +373,19 @@ def add_circular_option_to_conv_2d():
 
 
 model_hijack = StableDiffusionModelHijack()
+
+
+def register_buffer(self, name, attr):
+    """
+    Fix register buffer bug for Mac OS.
+    """
+
+    if type(attr) == torch.Tensor:
+        if attr.device != devices.device:
+            attr = attr.to(device=devices.device, dtype=(torch.float32 if devices.device.type == 'mps' else None))
+
+    setattr(self, name, attr)
+
+
+ldm.models.diffusion.ddim.DDIMSampler.register_buffer = register_buffer
+ldm.models.diffusion.plms.PLMSSampler.register_buffer = register_buffer

@@ -1,29 +1,21 @@
 import html
-import os
 
 import gradio as gr
+import modules.hypernetworks.hypernetwork
+from modules import devices, sd_hijack, shared
 
-import modules.textual_inversion.textual_inversion
-import modules.textual_inversion.preprocess
-from modules import sd_hijack, shared, devices
-from modules.hypernetworks import hypernetwork
+not_available = ["hardswish", "multiheadattention"]
+keys = [x for x in modules.hypernetworks.hypernetwork.HypernetworkModule.activation_dict if x not in not_available]
 
 
-def create_hypernetwork(name, enable_sizes):
-    fn = os.path.join(shared.cmd_opts.hypernetwork_dir, f"{name}.pt")
-    assert not os.path.exists(fn), f"file {fn} already exists"
+def create_hypernetwork(name, enable_sizes, overwrite_old, layer_structure=None, activation_func=None, weight_init=None, add_layer_norm=False, use_dropout=False, dropout_structure=None):
+    filename = modules.hypernetworks.hypernetwork.create_hypernetwork(name, enable_sizes, overwrite_old, layer_structure, activation_func, weight_init, add_layer_norm, use_dropout, dropout_structure)
 
-    hypernet = modules.hypernetworks.hypernetwork.Hypernetwork(name=name, enable_sizes=[int(x) for x in enable_sizes])
-    hypernet.save(fn)
-
-    shared.reload_hypernetworks()
-
-    return gr.Dropdown.update(choices=sorted([x for x in shared.hypernetworks.keys()])), f"Created: {fn}", ""
+    return gr.Dropdown.update(choices=sorted(shared.hypernetworks)), f"Created: {filename}", ""
 
 
 def train_hypernetwork(*args):
-
-    initial_hypernetwork = shared.loaded_hypernetwork
+    shared.loaded_hypernetworks = []
 
     assert not shared.cmd_opts.lowvram, 'Training models with lowvram is not possible'
 
@@ -40,7 +32,6 @@ Hypernetwork saved to {html.escape(filename)}
     except Exception:
         raise
     finally:
-        shared.loaded_hypernetwork = initial_hypernetwork
         shared.sd_model.cond_stage_model.to(devices.device)
         shared.sd_model.first_stage_model.to(devices.device)
         sd_hijack.apply_optimizations()

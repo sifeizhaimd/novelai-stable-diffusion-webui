@@ -1,119 +1,113 @@
 
 let currentWidth = null;
 let currentHeight = null;
-let arFrameTimeout = setTimeout(function(){},0);
+let arFrameTimeout = setTimeout(function() {}, 0);
 
-function dimensionChange(e,dimname){
+function dimensionChange(e, is_width, is_height) {
 
-	if(dimname == 'Width'){
-		currentWidth = e.target.value*1.0
-	}
-	if(dimname == 'Height'){
-		currentHeight = e.target.value*1.0
-	}
+    if (is_width) {
+        currentWidth = e.target.value * 1.0;
+    }
+    if (is_height) {
+        currentHeight = e.target.value * 1.0;
+    }
 
-	var inImg2img   = Boolean(gradioApp().querySelector("button.rounded-t-lg.border-gray-200"))
+    var inImg2img = gradioApp().querySelector("#tab_img2img").style.display == "block";
 
-	if(!inImg2img){
-		return;
-	}
+    if (!inImg2img) {
+        return;
+    }
 
-	var img2imgMode = gradioApp().querySelector('#mode_img2img.tabs > div > button.rounded-t-lg.border-gray-200')
-	if(img2imgMode){
-		img2imgMode=img2imgMode.innerText
-	}else{
-		return;
-	}
+    var targetElement = null;
 
-	var redrawImage = gradioApp().querySelector('div[data-testid=image] img');
-	var inpaintImage = gradioApp().querySelector('#img2maskimg div[data-testid=image] img')
+    var tabIndex = get_tab_index('mode_img2img');
+    if (tabIndex == 0) { // img2img
+        targetElement = gradioApp().querySelector('#img2img_image div[data-testid=image] img');
+    } else if (tabIndex == 1) { //Sketch
+        targetElement = gradioApp().querySelector('#img2img_sketch div[data-testid=image] img');
+    } else if (tabIndex == 2) { // Inpaint
+        targetElement = gradioApp().querySelector('#img2maskimg div[data-testid=image] img');
+    } else if (tabIndex == 3) { // Inpaint sketch
+        targetElement = gradioApp().querySelector('#inpaint_sketch div[data-testid=image] img');
+    }
 
-	var targetElement = null;
 
-	if(img2imgMode=='img2img' && redrawImage){
-		targetElement = redrawImage;
-	}else if(img2imgMode=='Inpaint' && inpaintImage){
-		targetElement = inpaintImage;
-	}
+    if (targetElement) {
 
-	if(targetElement){
-
-		var arPreviewRect = gradioApp().querySelector('#imageARPreview');
-		if(!arPreviewRect){
-		    arPreviewRect = document.createElement('div')
-		    arPreviewRect.id = "imageARPreview";
-		    gradioApp().getRootNode().appendChild(arPreviewRect)
-		}
+        var arPreviewRect = gradioApp().querySelector('#imageARPreview');
+        if (!arPreviewRect) {
+            arPreviewRect = document.createElement('div');
+            arPreviewRect.id = "imageARPreview";
+            gradioApp().appendChild(arPreviewRect);
+        }
 
 
 
-		var viewportOffset = targetElement.getBoundingClientRect();
+        var viewportOffset = targetElement.getBoundingClientRect();
 
-		viewportscale = Math.min(  targetElement.clientWidth/targetElement.naturalWidth, targetElement.clientHeight/targetElement.naturalHeight )
+        var viewportscale = Math.min(targetElement.clientWidth / targetElement.naturalWidth, targetElement.clientHeight / targetElement.naturalHeight);
 
-		scaledx = targetElement.naturalWidth*viewportscale
-		scaledy = targetElement.naturalHeight*viewportscale
+        var scaledx = targetElement.naturalWidth * viewportscale;
+        var scaledy = targetElement.naturalHeight * viewportscale;
 
-		cleintRectTop    = (viewportOffset.top+window.scrollY)
-		cleintRectLeft   = (viewportOffset.left+window.scrollX)
-		cleintRectCentreY = cleintRectTop  + (targetElement.clientHeight/2)
-		cleintRectCentreX = cleintRectLeft + (targetElement.clientWidth/2)
+        var cleintRectTop = (viewportOffset.top + window.scrollY);
+        var cleintRectLeft = (viewportOffset.left + window.scrollX);
+        var cleintRectCentreY = cleintRectTop + (targetElement.clientHeight / 2);
+        var cleintRectCentreX = cleintRectLeft + (targetElement.clientWidth / 2);
 
-		viewRectTop    = cleintRectCentreY-(scaledy/2)
-		viewRectLeft   = cleintRectCentreX-(scaledx/2)
-		arRectWidth  = scaledx
-		arRectHeight = scaledy
+        var arscale = Math.min(scaledx / currentWidth, scaledy / currentHeight);
+        var arscaledx = currentWidth * arscale;
+        var arscaledy = currentHeight * arscale;
 
-		arscale = Math.min(  arRectWidth/currentWidth, arRectHeight/currentHeight )
-		arscaledx = currentWidth*arscale
-		arscaledy = currentHeight*arscale
+        var arRectTop = cleintRectCentreY - (arscaledy / 2);
+        var arRectLeft = cleintRectCentreX - (arscaledx / 2);
+        var arRectWidth = arscaledx;
+        var arRectHeight = arscaledy;
 
-		arRectTop    = cleintRectCentreY-(arscaledy/2)
-		arRectLeft   = cleintRectCentreX-(arscaledx/2)
-		arRectWidth  = arscaledx
-		arRectHeight = arscaledy
+        arPreviewRect.style.top = arRectTop + 'px';
+        arPreviewRect.style.left = arRectLeft + 'px';
+        arPreviewRect.style.width = arRectWidth + 'px';
+        arPreviewRect.style.height = arRectHeight + 'px';
 
-	    arPreviewRect.style.top  = arRectTop+'px';
-	    arPreviewRect.style.left = arRectLeft+'px';
-	    arPreviewRect.style.width = arRectWidth+'px';
-	    arPreviewRect.style.height = arRectHeight+'px';
+        clearTimeout(arFrameTimeout);
+        arFrameTimeout = setTimeout(function() {
+            arPreviewRect.style.display = 'none';
+        }, 2000);
 
-	    clearTimeout(arFrameTimeout);
-	    arFrameTimeout = setTimeout(function(){
-	    	arPreviewRect.style.display = 'none';
-	    },2000);
+        arPreviewRect.style.display = 'block';
 
-	    arPreviewRect.style.display = 'block';
-
-	}
+    }
 
 }
 
 
-onUiUpdate(function(){
-	var arPreviewRect = gradioApp().querySelector('#imageARPreview');
-	if(arPreviewRect){
-		arPreviewRect.style.display = 'none';
-	}
-	var inImg2img   = Boolean(gradioApp().querySelector("button.rounded-t-lg.border-gray-200"))
-	if(inImg2img){
-		let inputs = gradioApp().querySelectorAll('input');
-		inputs.forEach(function(e){ 
-			let parentLabel = e.parentElement.querySelector('label')
-			if(parentLabel && parentLabel.innerText){
-				if(!e.classList.contains('scrollwatch')){
-					if(parentLabel.innerText == 'Width' || parentLabel.innerText == 'Height'){
-						e.addEventListener('input', function(e){dimensionChange(e,parentLabel.innerText)} )
-						e.classList.add('scrollwatch')
-					}
-					if(parentLabel.innerText == 'Width'){
-						currentWidth = e.value*1.0
-					}
-					if(parentLabel.innerText == 'Height'){
-						currentHeight = e.value*1.0
-					}
-				}
-			} 
-		})
-	}
+onAfterUiUpdate(function() {
+    var arPreviewRect = gradioApp().querySelector('#imageARPreview');
+    if (arPreviewRect) {
+        arPreviewRect.style.display = 'none';
+    }
+    var tabImg2img = gradioApp().querySelector("#tab_img2img");
+    if (tabImg2img) {
+        var inImg2img = tabImg2img.style.display == "block";
+        if (inImg2img) {
+            let inputs = gradioApp().querySelectorAll('input');
+            inputs.forEach(function(e) {
+                var is_width = e.parentElement.id == "img2img_width";
+                var is_height = e.parentElement.id == "img2img_height";
+
+                if ((is_width || is_height) && !e.classList.contains('scrollwatch')) {
+                    e.addEventListener('input', function(e) {
+                        dimensionChange(e, is_width, is_height);
+                    });
+                    e.classList.add('scrollwatch');
+                }
+                if (is_width) {
+                    currentWidth = e.value * 1.0;
+                }
+                if (is_height) {
+                    currentHeight = e.value * 1.0;
+                }
+            });
+        }
+    }
 });
